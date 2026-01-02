@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+import torch.nn.functional as F
+
+import torch
+from torch import nn
+
+
+class CausalAttention(nn.Module):
+    """
+    Multi-head causal (masked) self-attention.
+
+    Causal = each token can only attend to previous tokens (not future ones).
+    This is what makes GPT autoregressive - it predicts next token based on past only.
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+
+        # n_embd must be divisible by n_head so we can split evenly
+        # e.g., 384 / 6 = 64 dimensions per head
+        assert self.config.n_embd % config.n_head == 0
+
+        # Projects input to Q, K, V all at once (3x the size)
+        # (B, T, C) -> (B, T, 3*C)
+        # e.g., (32, 256, 384) -> (32, 256, 1152)
+        #
+        # NOTE: Linear layers only operate on the LAST dimension (C).
+        # T (256) is NOT a parameter - PyTorch broadcasts the same weights
+        # across all 256 positions. Each position is transformed independently.
+        # Position interaction happens ONLY in attention (the T×T matrix).
+        # Position info comes from: (1) wpe embeddings, (2) attention patterns.
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+
+        # Output projection: combines all heads back to n_embd
+        # (B, T, C) -> (B, T, C)
+        #
+        # Why c_proj when we have MLP next?
+        # After concat, heads are just stacked [h1|h2|h3|h4|h5|h6], not mixed.
+        # c_proj is a learned (384×384) matrix that MIXES info across all heads.
+        # Each output dim can pull from any head's features.
+        # MLP is different: (1) has non-linearity, (2) expands/contracts,
+        # (3) still processes each position independently (no cross-head mixing).
+        # Also: c_proj output goes through residual ADD before MLP sees it.
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        self.n_head = config.n_head  # H = 6 heads
+        self.n_embd = config.n_embd  # C = 384 embedding dim
+
+        # Causal mask: lower triangular matrix of ones
+        # Prevents attending to future tokens
+        # Shape: (1, 1, block_size, block_size) for broadcasting
+        # e.g., (1, 1, 256, 256)
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                1, 1, config.block_size, config.block_size
+            ),
+        )
+
+    def forward(self, x):
+        # x shape: (B, T, C) = (batch, sequence_length, embedding_dim)
+        # e.g., (32, 256, 384)
+        B, T, C = x.size()
+
+        # Project to Q, K, V combined
+        # (B, T, C) -> (B, T, 3*C)
+        qkv = self.c_attn(x)
+
+        # Split into Q, K, V each of shape (B, T, C)
+        # e.g., (32, 256, 384) each
+        q, k, v = qkv.split(self.n_embd, dim=2)
+
+        # Reshape for multi-head attention:
+        # (B, T, C) -> (B, T, H, C/H) -> (B, H, T, C/H)
+        # e.g., (32, 256, 384) -> (32, 256, 6, 64) -> (32, 6, 256, 64)
+        # Now each head has its own 64-dim subspace
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # Attention scores: Q @ K^T / sqrt(d_k)
+        # (B, H, T, 64) @ (B, H, 64, T) -> (B, H, T, T)
+        # e.g., (32, 6, 256, 64) @ (32, 6, 64, 256) -> (32, 6, 256, 256)
+        #
+        # THIS is where T×T interaction happens!
+        # The (256, 256) matrix = each token attending to every other token.
+        # This is the ONLY place in the model where positions "talk" to each other.
+        # Linear/MLP layers process each position independently (no T×T).
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+        # Apply causal mask: set future positions to -inf
+        # After softmax, -inf becomes 0 (no attention to future)
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+
+        # Softmax over last dim (keys) to get attention weights
+        # Each row sums to 1.0
+        att = F.softmax(att, dim=-1)
+
+        # Apply attention to values
+        # (B, H, T, T) @ (B, H, T, 64) -> (B, H, T, 64)
+        # e.g., (32, 6, 256, 256) @ (32, 6, 256, 64) -> (32, 6, 256, 64)
+        y = att @ v
+
+        # Reshape back: concatenate all heads
+        # Step by step:
+        #   y starts as:        (B, H, T, C/H) = (32, 6, 256, 64)
+        #   .transpose(1, 2):   (B, T, H, C/H) = (32, 256, 6, 64)  swap H and T dims
+        #   .contiguous():      (32, 256, 6, 64)  make memory layout contiguous
+        #                       (required before .view() after transpose)
+        #   .view(B, T, C):     (32, 256, 384)  flatten last 2 dims: 6*64=384
+        #                       = concatenate all 6 heads back together
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Final output projection
+        # (B, T, C) -> (B, T, C)
+        y = self.c_proj(y)
+
+        return y
+
+
+class MLP(nn.Module):
+    """
+    Feed-forward network (FFN) in transformer block.
+
+    Two linear layers with GELU activation in between.
+    Expands to 4x the embedding dim, then projects back down.
+    This gives the model more capacity to learn complex transformations.
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+
+        # Why expand then contract (384 -> 1536 -> 384)?
+        #
+        # 1. MORE EXPRESSIVE POWER: The 4x expansion creates a larger hidden space
+        #    where complex patterns can be detected. Think of it as having more
+        #    "neurons" to detect different features before summarizing.
+        #
+        # 2. NON-LINEAR FEATURE DETECTION: The GELU activation between the two
+        #    linear layers allows learning non-linear combinations. Without the
+        #    expansion, we'd have less capacity for non-linear transformations.
+        #
+        # 3. BOTTLENECK ARCHITECTURE: Contract back to 384 to:
+        #    - Keep residual stream dimension consistent
+        #    - Force the network to compress/summarize what it learned
+        #    - Reduce parameter count vs staying at 1536
+        #
+        # 4. WHY 4x? Empirically works well. Some models use 8/3x (LLaMA) or other
+        #    ratios. It's a tradeoff between capacity and compute.
+
+        # Expansion layer: C -> 4*C
+        # (B, T, 384) -> (B, T, 1536)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+
+        # GELU activation (smoother than ReLU)
+        # tanh approximation is faster and used in original GPT-2
+        self.gelu = nn.GELU(approximate="tanh")
+
+        # Projection layer: 4*C -> C
+        # (B, T, 1536) -> (B, T, 384)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+
+    def forward(self, x):
+        # x: (B, T, C) e.g., (32, 256, 384)
+
+        x = self.c_fc(x)    # (32, 256, 384) -> (32, 256, 1536)  expand
+        x = self.gelu(x)    # (32, 256, 1536) -> (32, 256, 1536) activation
+        x = self.c_proj(x)  # (32, 256, 1536) -> (32, 256, 384)  contract
+
+        return x
+
+
+class Block(nn.Module):
+    """
+    Single transformer block: LayerNorm -> Attention -> LayerNorm -> MLP
+
+    Uses pre-norm architecture (LayerNorm before attention/MLP, not after).
+    Residual connections add the input back after each sub-layer.
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+
+        # Layer norms normalize across the embedding dimension (C)
+        self.ln_1 = nn.LayerNorm(config.n_embd)  # before attention
+        self.attn = CausalAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)  # before MLP
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        # x: (B, T, C) e.g., (32, 256, 384)
+
+        # Attention with residual connection
+        # x = x + attn(ln_1(x))
+        # Residual lets gradients flow directly through the network
+        x = x + self.attn(self.ln_1(x))  # (32, 256, 384) -> (32, 256, 384)
+
+        # MLP with residual connection
+        x = x + self.mlp(self.ln_2(x))   # (32, 256, 384) -> (32, 256, 384)
+
+        return x
+
+
+@dataclass
+class GPTConfig:
+    """
+    Configuration for GPT model.
+
+    Default values are for a small model (good for learning/debugging).
+    GPT-2 small: block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768
+    """
+
+    block_size: int = 256   # T: max sequence length (context window)
+    vocab_size: int = 65    # V: number of unique tokens (e.g., characters)
+    n_layer: int = 6        # L: number of transformer blocks
+    n_head: int = 6         # H: number of attention heads
+    n_embd: int = 384       # C: embedding dimension (must be divisible by n_head)
+    # head_dim = n_embd / n_head = 384 / 6 = 64
+
+
+class GPT(nn.Module):
+    """
+    GPT (Generative Pre-trained Transformer) Language Model.
+
+    Architecture:
+    1. Token + Position Embeddings
+    2. N Transformer Blocks (attention + MLP with residuals)
+    3. Final LayerNorm
+    4. Output projection to vocabulary logits
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(
+            dict(
+                # Token embedding: maps token IDs to vectors
+                # (B, T) -> (B, T, C)
+                # e.g., (32, 256) -> (32, 256, 384)
+                # Lookup table of shape (vocab_size, n_embd) = (65, 384)
+                wte=nn.Embedding(
+                    config.vocab_size, config.n_embd
+                ),
+
+                # Position embedding: encodes position information
+                # Lookup table of shape (block_size, n_embd) = (256, 384)
+                # Position 0 gets one vector, position 1 gets another, etc.
+                wpe=nn.Embedding(
+                    config.block_size, config.n_embd
+                ),
+
+                # Stack of transformer blocks
+                # Each block: (B, T, C) -> (B, T, C)
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+
+                # Final layer norm before output projection
+                ln_f=nn.LayerNorm(config.n_embd),
+            )
+        )
+
+        # Output projection: embedding dim -> vocab size
+        # (B, T, C) -> (B, T, V)
+        # e.g., (32, 256, 384) -> (32, 256, 65)
+        # Produces logits (unnormalized scores) for each token in vocab
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
