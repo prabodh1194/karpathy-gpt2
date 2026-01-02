@@ -166,8 +166,8 @@ class MLP(nn.Module):
     def forward(self, x):
         # x: (B, T, C) e.g., (32, 256, 384)
 
-        x = self.c_fc(x)    # (32, 256, 384) -> (32, 256, 1536)  expand
-        x = self.gelu(x)    # (32, 256, 1536) -> (32, 256, 1536) activation
+        x = self.c_fc(x)  # (32, 256, 384) -> (32, 256, 1536)  expand
+        x = self.gelu(x)  # (32, 256, 1536) -> (32, 256, 1536) activation
         x = self.c_proj(x)  # (32, 256, 1536) -> (32, 256, 384)  contract
 
         return x
@@ -199,7 +199,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))  # (32, 256, 384) -> (32, 256, 384)
 
         # MLP with residual connection
-        x = x + self.mlp(self.ln_2(x))   # (32, 256, 384) -> (32, 256, 384)
+        x = x + self.mlp(self.ln_2(x))  # (32, 256, 384) -> (32, 256, 384)
 
         return x
 
@@ -213,11 +213,11 @@ class GPTConfig:
     GPT-2 small: block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768
     """
 
-    block_size: int = 256   # T: max sequence length (context window)
-    vocab_size: int = 65    # V: number of unique tokens (e.g., characters)
-    n_layer: int = 6        # L: number of transformer blocks
-    n_head: int = 6         # H: number of attention heads
-    n_embd: int = 384       # C: embedding dimension (must be divisible by n_head)
+    block_size: int = 1024  # T: max sequence length (context window)
+    vocab_size: int = 50257  # V: number of unique tokens (e.g., characters) -> 256 byte tokens + 50000 BPE merges + 1 <|endoftext|> token
+    n_layer: int = 12  # L: number of transformer blocks
+    n_head: int = 12  # H: number of attention heads
+    n_embd: int = 768  # C: embedding dimension (must be divisible by n_head)
     # head_dim = n_embd / n_head = 384 / 6 = 64
 
 
@@ -242,21 +242,14 @@ class GPT(nn.Module):
                 # (B, T) -> (B, T, C)
                 # e.g., (32, 256) -> (32, 256, 384)
                 # Lookup table of shape (vocab_size, n_embd) = (65, 384)
-                wte=nn.Embedding(
-                    config.vocab_size, config.n_embd
-                ),
-
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
                 # Position embedding: encodes position information
                 # Lookup table of shape (block_size, n_embd) = (256, 384)
                 # Position 0 gets one vector, position 1 gets another, etc.
-                wpe=nn.Embedding(
-                    config.block_size, config.n_embd
-                ),
-
+                wpe=nn.Embedding(config.block_size, config.n_embd),
                 # Stack of transformer blocks
                 # Each block: (B, T, C) -> (B, T, C)
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-
                 # Final layer norm before output projection
                 ln_f=nn.LayerNorm(config.n_embd),
             )
