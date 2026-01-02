@@ -353,7 +353,7 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
-device = "cpu"  # OVERRRIDE
+# device = "cpu"  # OVERRRIDE
 
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
@@ -363,14 +363,23 @@ text = text[:1000]
 
 tokens = enc.encode(text)
 B, T = 4, 32
-buf = torch.tensor(tokens[: B * T + 1])
+buf = torch.tensor(tokens[: B * T + 1]).to(device)
 x = buf[:-1].view(B, T)
 y = buf[1:].view(B, T)
 
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
-logits, loss = model(x, y)
+# logits, loss = model(x, y)
+
+optimiser = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for i in range(50):
+    optimiser.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimiser.step()
+    print(f"step: {i}, loss: {loss.item()}")
 
 print(logits.shape)
 print(loss)
