@@ -263,6 +263,9 @@ class GPT(nn.Module):
         # Produces logits (unnormalized scores) for each token in vocab
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert (
