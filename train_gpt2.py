@@ -434,7 +434,7 @@ train_loader = DataLoaderLite(B=4, T=512 * 2)  # works super-well on M3 with bf1
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 if device == "cuda":
     model = torch.compile(model)
