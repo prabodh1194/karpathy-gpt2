@@ -47,6 +47,9 @@ class CausalAttention(nn.Module):
         # (3) still processes each position independently (no cross-head mixing).
         # Also: c_proj output goes through residual ADD before MLP sees it.
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # Mark this layer for scaled initialization (see _init_weights)
+        # This is the "exit ramp" onto the residual stream - needs smaller init
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head  # H = 6 heads
         self.n_embd = config.n_embd  # C = 384 embedding dim
@@ -164,6 +167,9 @@ class MLP(nn.Module):
         # Projection layer: 4*C -> C
         # (B, T, 1536) -> (B, T, 384)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        # Mark this layer for scaled initialization (see _init_weights)
+        # This is the "exit ramp" onto the residual stream - needs smaller init
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         # x: (B, T, C) e.g., (32, 256, 384)
@@ -265,6 +271,24 @@ class GPT(nn.Module):
 
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # GPT-2 paper initialization: scale down weights of residual projections.
+                # Each transformer block adds to the residual stream twice (attn.c_proj + mlp.c_proj),
+                # so we scale by 1/sqrt(2*n_layer) to keep variance stable as depth increases.
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -385,6 +409,8 @@ class DataLoaderLite:
         return x, y
 
 
+import time
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -393,7 +419,12 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 print(f"using device: {device}")
 # device = "cpu"  # OVERRRIDE
 
-train_loader = DataLoaderLite(B=4, T=32)
+torch.manual_seed(1337)
+torch.mps.manual_seed(1337)
+
+train_loader = DataLoaderLite(B=4, T=512)
+# train_loader = DataLoaderLite(B=4, T=1024)
+# train_loader = DataLoaderLite(B=16, T=1024)
 
 # get logits
 model = GPT(GPTConfig())
@@ -403,13 +434,17 @@ model.to(device)
 optimiser = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimiser.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimiser.step()
-    print(f"step: {i}, loss: {loss.item()}")
+    torch.mps.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    print(f"step: {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
 
 print(logits.shape)
 print(loss)
