@@ -86,6 +86,7 @@ class CausalAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
+        '''
         # Attention scores: Q @ K^T / sqrt(d_k)
         # (B, H, T, 64) @ (B, H, 64, T) -> (B, H, T, T)
         # e.g., (32, 6, 256, 64) @ (32, 6, 64, 256) -> (32, 6, 256, 256)
@@ -108,6 +109,10 @@ class CausalAttention(nn.Module):
         # (B, H, T, T) @ (B, H, T, 64) -> (B, H, T, 64)
         # e.g., (32, 6, 256, 256) @ (32, 6, 256, 64) -> (32, 6, 256, 64)
         y = att @ v
+        '''
+
+        # flash-attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # Reshape back: concatenate all heads
         # Step by step:
