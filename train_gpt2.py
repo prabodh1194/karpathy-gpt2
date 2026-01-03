@@ -422,9 +422,11 @@ print(f"using device: {device}")
 torch.manual_seed(1337)
 torch.mps.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=512)
+train_loader = DataLoaderLite(B=4, T=512 * 2)  # works super-well on M3 with bf16 dtype
 # train_loader = DataLoaderLite(B=4, T=1024)
 # train_loader = DataLoaderLite(B=16, T=1024)
+
+torch.set_float32_matmul_precision('high')
 
 # get logits
 model = GPT(GPTConfig())
@@ -438,13 +440,15 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimiser.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimiser.step()
     torch.mps.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    print(f"step: {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step: {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 print(logits.shape)
 print(loss)
